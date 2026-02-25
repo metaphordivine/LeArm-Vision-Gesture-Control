@@ -5,3 +5,39 @@ An advanced ESP32-based control system for LeArm (6DOF), featuring real-time han
 🎨 Color Recognition: HSV-based color detection with a custom tuning UI and morphological filtering for stable sorting. (基于 HSV 空间的颜色识别，配备实时调参界面与形态学滤波，实现稳定分拣)
 🔍 YOLO Intelligence: Integrated YOLOv8 model for advanced object classification and automated pick-and-place. (集成 YOLOv8 模型，实现高级物体分类与全自动抓取投放)
 📐 Precise Calibration: Support for standard A4 paper calibration using homography matrix for cm-level accuracy. (支持标准 A4 纸单应性矩阵标定，实现厘米级抓取精度)
+flowchart LR
+    subgraph PC[PC 端（Python）]
+        A1[摄像头视频流<br>ESP32-CAM] --> A2[多线程读取 VideoStream]
+        A2 --> A3[视觉检测<br>YOLOv8 / HSV]
+        A3 --> A4[像素坐标 (u,v)]
+        A4 --> A5[透视变换矩阵 H<br>标定]
+        A5 --> A6[世界坐标 (Xw, Yw)]
+        A6 --> A7[机械臂坐标系映射 (X,Y,Z)]
+        A7 --> A8[UDP/HTTP 指令发送]
+    end
+
+    A8 -- WiFi --> B1
+
+    subgraph ESP32[ESP32 机械臂控制端]
+        B1[UDP/HTTP 指令解析] --> B2[智能 IK 姿态求解<br>6DOF]
+        B2 --> B3[舵机控制<br>PWM/串口]
+        B3 --> B4[机械臂执行动作]
+    end
+
+flowchart TD
+    A1[摄像头视频流] --> A2[多线程读取 VideoStream]
+    A2 --> A3[HSV 颜色检测<br>形态学处理]
+    A2 --> A4[YOLOv8n 目标检测]
+    A3 --> A5[目标筛选<br>类别/大小/稳定性]
+    A4 --> A5
+    A5 --> A6[像素坐标 (u,v)]
+    A6 --> A7[透视变换矩阵 H]
+    A7 --> A8[世界坐标 (Xw, Yw)]
+    A8 --> A9[机械臂坐标系转换]
+
+flowchart TD
+    A1[PC 端发送 UDP/HTTP 指令<br>x,y,z,claw,mode] --> A2[ESP32 接收数据包]
+    A2 --> A3[指令解析<br>模式判断]
+    A3 --> A4[智能 IK 求解<br>自动 pitch 调整<br>手腕俯仰参与]
+    A4 --> A5[舵机控制<br>PWM/串口]
+    A5 --> A6[机械臂执行动作<br>抓取/放置]
