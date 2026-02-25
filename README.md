@@ -1,10 +1,24 @@
-# LeArm-Vision-Gesture-Control
-An advanced ESP32-based control system for LeArm (6DOF), featuring real-time hand gesture following via MediaPipe, HSV color-based sorting, and YOLOv8 intelligent object detection. Optimized with low-latency UDP communication and a multi-threaded video stream.
-基于 ESP32 的 LeArm（6自由度）高级控制系统。集成了基于 MediaPipe 的实时手势跟随、基于 HSV 空间的角度颜色识别分拣、以及 YOLOv8 深度学习目标检测。采用低延迟 UDP 通信协议与多线程视频流优化。
-🖐️ Gesture Control: Real-time 3D coordinate mapping using MediaPipe to follow hand movements with millisecond latency via UDP. (基于 MediaPipe 的实时手势三维坐标映射，通过 UDP 实现毫秒级随动)
-🎨 Color Recognition: HSV-based color detection with a custom tuning UI and morphological filtering for stable sorting. (基于 HSV 空间的颜色识别，配备实时调参界面与形态学滤波，实现稳定分拣)
-🔍 YOLO Intelligence: Integrated YOLOv8 model for advanced object classification and automated pick-and-place. (集成 YOLOv8 模型，实现高级物体分类与全自动抓取投放)
-📐 Precise Calibration: Support for standard A4 paper calibration using homography matrix for cm-level accuracy. (支持标准 A4 纸单应性矩阵标定，实现厘米级抓取精度)
+🌟 LeArm Vision & Gesture Control System
+基于 YOLOv8 + MediaPipe + ESP32 的智能机械臂视觉抓取与手势控制系统
+🚀 项目简介
+本项目实现了：
+
+🎯 YOLOv8 俯视视觉抓取（支持小物体 < 5cm）
+
+🖐️ MediaPipe 手势控制机械臂（实时跟随）
+
+🎨 HSV 颜色分拣（红绿蓝）
+
+📡 UDP + HTTP 双通道通信
+
+🤖 智能 IK 姿态控制（Z→pitch 自动调整）
+
+📐 A4 纸四点透视标定（像素→世界坐标）
+
+这是一个完整的 视觉 + 控制 + 机械臂 工程项目。
+
+🏗️ 系统总体架构
+mermaid
 flowchart LR
     subgraph PC[PC 端（Python）]
         A1[摄像头视频流<br>ESP32-CAM] --> A2[多线程读取 VideoStream]
@@ -23,7 +37,8 @@ flowchart LR
         B2 --> B3[舵机控制<br>PWM/串口]
         B3 --> B4[机械臂执行动作]
     end
-
+👁️ 视觉处理流程
+mermaid
 flowchart TD
     A1[摄像头视频流] --> A2[多线程读取 VideoStream]
     A2 --> A3[HSV 颜色检测<br>形态学处理]
@@ -34,10 +49,73 @@ flowchart TD
     A6 --> A7[透视变换矩阵 H]
     A7 --> A8[世界坐标 (Xw, Yw)]
     A8 --> A9[机械臂坐标系转换]
-
+🤖 机械臂控制流程
+mermaid
 flowchart TD
     A1[PC 端发送 UDP/HTTP 指令<br>x,y,z,claw,mode] --> A2[ESP32 接收数据包]
     A2 --> A3[指令解析<br>模式判断]
     A3 --> A4[智能 IK 求解<br>自动 pitch 调整<br>手腕俯仰参与]
     A4 --> A5[舵机控制<br>PWM/串口]
     A5 --> A6[机械臂执行动作<br>抓取/放置]
+✨ 功能亮点
+🔹 YOLOv8 俯视抓取（支持小物体 < 5cm）
+自动过滤大物体
+
+自动稳定检测（防抖）
+
+自动选择最近目标
+
+🔹 MediaPipe 手势控制
+手腕位置 → X/Y/Z
+
+食指弯曲 → 夹爪开合
+
+死区 + 滤波 → 稳定控制
+
+🔹 智能 IK 姿态控制（6DOF）
+Z 低 → 垂直向下抓取
+
+Z 高 → 更水平，避免无解
+
+手腕俯仰自由参与 IK
+
+🔹 透视标定（A4 纸）
+点击四角 → 自动求单应矩阵
+
+像素坐标 → 世界坐标（cm）
+
+机械臂坐标系自动对齐
+
+📦 文件结构
+代码
+LeArm-Vision-Gesture-Control/
+│
+├── vision/
+│   ├── yolo_grab.py
+│   ├── hsv_sort.py
+│   ├── calibration.py
+│   └── utils/
+│
+├── esp32/
+│   ├── main.cpp
+│   ├── Robot_arm.hpp
+│   ├── Hiwonder.hpp
+│   └── IK/
+│
+├── media/
+│   ├── demo1.jpg
+│   ├── demo2.jpg
+│   └── architecture.png
+│
+└── README.md
+🛠️ 运行方式
+PC 端（Python）
+bash
+pip install ultralytics opencv-python mediapipe numpy
+python yolo_grab.py
+ESP32 端
+使用 Arduino IDE / PlatformIO 编译
+
+选择 ESP32 Dev Module
+
+上传 main.cpp
