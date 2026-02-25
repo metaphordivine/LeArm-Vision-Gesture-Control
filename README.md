@@ -29,58 +29,55 @@
 
 ---
 
-🏗️ 系统总体架构（修复后的 Mermaid）
+🏗️ 系统总体架构
 ```mermaid
-flowchart LR
-    subgraph PC[PC 端（Python）]
-        A1[摄像头视频流<br>ESP32-CAM] --> A2[多线程读取 VideoStream]
-        A2 --> A3[视觉检测<br>YOLOv8 / HSV]
-        A3 --> A4[像素坐标 (u,v)]
-        A4 --> A5[透视变换矩阵 H<br>标定]
-        A5 --> A6[世界坐标 (Xw, Yw)]
-        A6 --> A7[机械臂坐标系映射 (X,Y,Z)]
-        A7 --> A8[UDP/HTTP 指令发送]
+flowchart TD
+    subgraph PC["PC 端（Python）"]
+        A1["摄像头视频流<br>ESP32-CAM"] --> A2["多线程读取 VideoStream"]
+        A2 --> A3["视觉检测<br>YOLOv8 / HSV"]
+        A3 --> A4["像素坐标 (u,v)"]
+        A4 --> A5["透视变换矩阵 H<br>标定"]
+        A5 --> A6["世界坐标 (Xw, Yw)"]
+        A6 --> A7["机械臂坐标系映射 (X,Y,Z)"]
+        A7 --> A8["UDP/HTTP 指令发送"]
     end
 
-    A8 -->|WiFi| B1
+    A8 ==>|WiFi| B1
 
-    subgraph ESP32[ESP32 机械臂控制端]
-        B1[UDP/HTTP 指令解析] --> B2[智能 IK 姿态求解<br>6DOF]
-        B2 --> B3[舵机控制<br>PWM/串口]
-        B3 --> B4[机械臂执行动作]
+    subgraph ESP32["ESP32 机械臂控制端"]
+        B1["UDP/HTTP 指令解析"] --> B2["智能 IK 姿态求解<br>6DOF"]
+        B2 --> B3["舵机控制<br>PWM/串口"]
+        B3 --> B4["机械臂执行动作"]
     end
+
 ```
 ---
 👁️ 视觉处理流程
 ```mermaid
 flowchart TD
-    A1[摄像头视频流] --> A2[多线程读取 VideoStream]
-    A2 --> A3[HSV 颜色检测<br>形态学处理]
-    A2 --> A4[YOLOv8n 目标检测]
-    A3 --> A5[目标筛选<br>类别/大小/稳定性]
+    A1["摄像头视频流"] --> A2["多线程读取 VideoStream"]
+    A2 --> A3["HSV 颜色检测<br>形态学处理"]
+    A2 --> A4["YOLOv8n 目标检测"]
+    A3 --> A5["目标筛选<br>类别/大小/稳定性"]
     A4 --> A5
-    A5 --> A6[像素坐标 (u,v)]
-    A6 --> A7[透视变换矩阵 H]
-    A7 --> A8[世界坐标 (Xw, Yw)]
-    A8 --> A9[机械臂坐标系转换]
+    A5 --> A6["像素坐标 (u,v)"]
+    A6 --> A7["透视变换矩阵 H"]
+    A7 --> A8["世界坐标 (Xw, Yw)"]
+    A8 --> A9["机械臂坐标系转换"]
+
 ```
 ---
 🤖 机械臂控制流程
 ```mermaid
 flowchart TD
-    A1[PC 端发送 UDP/HTTP 指令<br>x,y,z,claw,mode] --> A2[ESP32 接收数据包]
-    A2 --> A3[指令解析<br>模式判断]
-    A3 --> A4[智能 IK 求解<br>自动 pitch 调整<br>手腕俯仰参与]
-    A4 --> A5[舵机控制<br>PWM/串口]
-    A5 --> A6[机械臂执行动作<br>抓取/放置]
+    A1["PC 端发送 UDP/HTTP 指令<br>x,y,z,claw,mode"] --> A2["ESP32 接收数据包"]
+    A2 --> A3["指令解析<br>模式判断"]
+    A3 --> A4["智能 IK 求解<br>自动 pitch 调整<br>手腕俯仰参与"]
+    A4 --> A5["舵机控制<br>PWM/串口"]
+    A5 --> A6["机械臂执行动作<br>抓取/放置"]
 ```
 ✨ 功能亮点
-🔹 YOLOv8 俯视抓取（支持小物体 < 5cm）
-自动过滤大物体
-
-自动稳定检测（防抖）
-
-自动选择最近目标
+🔹 YOLOv8 俯视抓取
 
 🔹 MediaPipe 手势控制
 手腕位置 → X/Y/Z
