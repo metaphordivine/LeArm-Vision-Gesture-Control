@@ -9,8 +9,8 @@ LeArm_t arm;
 WebServer server(80);
 WiFiUDP udp;
 const int udpPort = 8888; // UDP 监听端口
-const char* ssid = "jaTest";
-const char* password = "jatestest";
+const char* ssid = "...";
+const char* password = "...";
 
 // ================= 2. 核心控制函数 =================
 // 增加软限位保护，防止舵机烧毁 (参数为角度)
