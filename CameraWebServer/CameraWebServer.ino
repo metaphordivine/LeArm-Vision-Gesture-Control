@@ -9,8 +9,8 @@
 // ===========================
 // Enter your WiFi credentials
 // ===========================
-const char *ssid = "jaTest";
-const char *password = "jatestest";
+const char *ssid = "...";
+const char *password = "...";
 
 void startCameraServer();
 void setupLedFlash();
