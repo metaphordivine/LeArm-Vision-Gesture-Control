@@ -6,7 +6,7 @@ import time
 from ultralytics import YOLO  # 导入 YOLO
 
 # ================= 配置 IP =================
-EYE_IP = "192.168.43.8"    # ESP32-CAM IP
+EYE_IP = "192.168.43.7"    # ESP32-CAM IP
 ARM_IP = "192.168.43.10"    # ESP32 机械臂 IP
 STREAM_URL = f"http://{EYE_IP}:81/stream"
 
@@ -22,8 +22,8 @@ CALIB_HEIGHT = 29.7 # Y轴方向长度
 
 # ================= YOLO 配置 =================
 # 加载模型 (首次运行会自动下载 yolov8n.pt)
-print("正在加载 YOLO 模型...")
-model = YOLO('yolov8n.pt') 
+print("正在加载 YOLO 实例分割模型...")
+model = YOLO('yolov8n-seg.pt')
 
 # ⭐ 定义你要抓取的物体及其投放位置
 # 格式: 'YOLO类别名': (投放X, 投放Y)
@@ -152,37 +152,44 @@ def mouse_callback(event, x, y, flags, param):
 
 # ⭐ YOLO 识别函数
 def detect_objects_yolo(frame):
-    # 使用 YOLO 进行预测
+    # 使用分割模型
     results = model.predict(frame, conf=conf_threshold, verbose=False)
-    
     objects = []
     
+    # 创建一个全黑的掩码模板用于处理
+    h, w = frame.shape[:2]
+
     for r in results:
-        boxes = r.boxes
-        for box in boxes:
-            # 获取类别ID和名称
-            cls_id = int(box.cls[0])
+        if r.masks is None: continue
+            
+        for i, mask_data in enumerate(r.masks.xy):
+            cls_id = int(r.boxes.cls[i])
             name = model.names[cls_id]
             
-            # 只识别我们在 DROP_POSITIONS 里定义的物体
             if name in TARGET_CLASSES:
-                # 获取坐标
-                x1, y1, x2, y2 = box.xyxy[0]
-                cx, cy = int((x1+x2)/2), int((y1+y2)/2)
+                # 1. 获取物体的二进制掩码 (Binary Mask)
+                # mask_data 是多边形坐标，转为填充好的黑白图
+                mask_img = np.zeros((h, w), dtype=np.uint8)
+                polygon = mask_data.astype(np.int32)
+                cv2.fillPoly(mask_img, [polygon], 255)
                 
-                # 绘制
-                cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
-                cv2.circle(frame, (cx, cy), 5, (0, 0, 255), -1)
-                cv2.putText(frame, f"{name} {box.conf[0]:.2f}", (int(x1), int(y1)-10), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                # 2. 核心算法：距离变换 (Distance Transform)
+                # 计算掩码内每个点到最近边缘的距离
+                dist_transform = cv2.distanceTransform(mask_img, cv2.DIST_L2, 5)
+                
+                # 3. 寻找最大值点（离边缘最远的点，即“最肉”的点）
+                _, max_val, _, max_loc = cv2.minMaxLoc(dist_transform)
+                cx, cy = max_loc  # 这就是最优抓取点
+                
+                # 绘制调试信息
+                # 绘制轮廓
+                cv2.polylines(frame, [polygon], True, (0, 255, 255), 2)
+                # 绘制这个“最深点”
+                cv2.circle(frame, (cx, cy), 6, (255, 0, 0), -1) 
+                cv2.putText(frame, f"{name} Center", (cx, cy-15), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
                 
                 objects.append((name, cx, cy))
-            else:
-                # (可选) 绘制其他物体但用灰色显示
-                x1, y1, x2, y2 = box.xyxy[0]
-                cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (100, 100, 100), 1)
-                cv2.putText(frame, name, (int(x1), int(y1)-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100, 100, 100), 1)
-
     return objects
 
 def main():
