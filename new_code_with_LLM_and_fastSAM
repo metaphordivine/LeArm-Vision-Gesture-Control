@@ -1,0 +1,1160 @@
+import cv2
+import numpy as np
+import math
+import requests
+import time
+import threading
+import torch
+import base64
+import queue
+from flask import Flask, render_template_string, request
+from openni import openni2
+from ultralytics import FastSAM
+from http import HTTPStatus
+import dashscope  # 阿里通义千问 SDK
+
+# ================= 🔧 配置区域 =================
+OPENNI_LIB_PATH = r'yourpath' 
+ARM_IP = "......"  #your esp32ip
+ROBOT_URL = f"http://{ARM_IP}/robot"
+
+# 阿里云 DashScope API Key
+DASHSCOPE_API_KEY = "......"  # 请替换为你的API Key
+
+# 机械臂参数
+TABLE_BASE_Z = 3.5  # 桌面高度（单位：cm），抓取时Z轴不能低于这个值
+HOVER_Z = 22.0       
+CALIB_WIDTH = 21.0   
+CALIB_HEIGHT = 29.7  
+
+GRIPPER_MAX_WIDTH_PIXELS = 100    # 机械爪最大开合度（像素），根据实际调整
+USE_SKELETON_GRASP = True         # 是否启用骨架化抓取
+SKELETON_SAMPLE_STEP = 10         # 骨架采样步长
+
+DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+print(f"🚀 整合版机械臂视觉系统启动 | 设备: {DEVICE}")
+
+# ================= 📊 Z轴自动校正拟合 =================
+# 用户提供的标定数据集 (x, y, z) 单位：cm
+# 第一行 (16.4, -2.9, 9.1) 为标准参考点
+CALIBRATION_DATA = [    #替换为你的误差测量
+    (16.4, -2.9, 9.1),   # 标准数据，正常抓取
+    (8.0, -1.7, 9.1),
+    (25.5, -2.7, 9.1),
+    (16.5, -7.9, 8.8),
+    (25.5, -10.4, 8.8),
+    (26.0, -17.0, 8.5),
+    (13.0, -16.3, 8.1),
+    (18.3, 1.8, 9.6),
+    (8.8, 3.8, 9.7),
+    (25.9, 3.1, 9.8),
+    (17.0, 9.5, 11.0),
+    (27.0, 9.0, 11.0),
+    (6.3, 9.9, 10.9),
+    (23.9, 16.2, 12.9),
+    (15.3, 17.2, 12.9),
+    (6.7, 17.3, 12.7)
+]
+
+# 计算误差：实际测量值 - 标准值 (9.1cm)
+REFERENCE_Z = 9.1
+calib_x = []
+calib_y = []
+calib_error = []
+for x, y, z in CALIBRATION_DATA:
+    calib_x.append(x)
+    calib_y.append(y)
+    calib_error.append(z - REFERENCE_Z)
+
+# 转换为numpy数组
+calib_x = np.array(calib_x)
+calib_y = np.array(calib_y)
+calib_error = np.array(calib_error)
+
+# 构建二阶多项式特征矩阵： [1, x, y, x^2, y^2, x*y]
+A = np.column_stack([
+    np.ones_like(calib_x),
+    calib_x,
+    calib_y,
+    calib_x**2,
+    calib_y**2,
+    calib_x * calib_y
+])
+
+# 使用最小二乘法拟合系数
+try:
+    coefficients, residuals, rank, s = np.linalg.lstsq(A, calib_error, rcond=None)
+    # coefficients 顺序: [c0, c1, c2, c3, c4, c5] 对应 1, x, y, x^2, y^2, x*y
+    print(f"✅ Z轴自动校正拟合完成，系数: {coefficients}")
+    if len(residuals) > 0:
+        print(f"   残差平方和: {residuals[0]:.4f}")
+except Exception as e:
+    print(f"❌ Z轴自动校正拟合失败: {e}")
+    coefficients = None
+
+def compute_z_error(x, y):
+    """根据拟合的多项式计算Z轴误差"""
+    if coefficients is None:
+        return 0.0
+    # 确保x, y是标量或数组
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    # 计算多项式值: c0 + c1*x + c2*y + c3*x^2 + c4*y^2 + c5*x*y
+    error = (coefficients[0] + 
+             coefficients[1] * x + 
+             coefficients[2] * y + 
+             coefficients[3] * x**2 + 
+             coefficients[4] * y**2 + 
+             coefficients[5] * x * y)
+    return error
+
+# 测试拟合效果（可选）
+if coefficients is not None:
+    print("📊 拟合效果验证:")
+    for i, (x, y, z) in enumerate(CALIBRATION_DATA):
+        pred_error = compute_z_error(x, y)
+        pred_z = z - pred_error  # 校正后的z应该接近REFERENCE_Z
+        print(f"  点{i+1}: ({x:.1f}, {y:.1f}) 测量z={z:.1f}, 误差={z-REFERENCE_Z:.2f}, 预测误差={pred_error:.2f}, 校正后z={pred_z:.2f}")
+
+# ================= 🌐 Flask 语音控制服务器 =================
+app = Flask(__name__)
+cmd_queue = queue.Queue()  # 存放手机发来的指令
+
+# 手机端 HTML 界面
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>机械臂控制终端</title>
+    <style>
+        body { background-color: #121212; color: #e0e0e0; font-family: 'Segoe UI', sans-serif; text-align: center; padding: 20px; }
+        
+        /* 炫酷的语音按钮 */
+        #mic-btn { 
+            width: 150px; height: 150px; border-radius: 50%; 
+            background: linear-gradient(145deg, #ff9800, #ff5722);
+            border: 4px solid #333; font-size: 50px; cursor: pointer;
+            box-shadow: 0 0 30px rgba(255, 87, 34, 0.4);
+            transition: all 0.2s; margin-bottom: 30px;
+        }
+        #mic-btn:active { transform: scale(0.9); box-shadow: 0 0 10px rgba(255, 87, 34, 0.8); }
+        
+        /* 兼容性更好的文本输入框 */
+        .input-group { margin-top: 20px; display: flex; justify-content: center; gap: 10px; }
+        #manual-input {
+            padding: 12px; border-radius: 8px; border: none; width: 60%;
+            font-size: 16px; background: #333; color: white;
+        }
+        #send-btn {
+            padding: 12px 20px; border-radius: 8px; border: none;
+            background: #00bcd4; color: white; font-weight: bold; cursor: pointer;
+        }
+
+        #status { margin-top: 20px; color: #888; font-size: 14px; min-height: 24px; }
+    </style>
+</head>
+<body>
+    <h2>🤖 具身智能控制台</h2>
+    
+    <!-- 方式1：原生语音识别按钮 (Safari/Chrome推荐) -->
+    <button id="mic-btn" onmousedown="startRec()" onmouseup="stopRec()" ontouchstart="startRec()" ontouchend="stopRec()">🎙️</button>
+    <div id="status">按住按钮说话，或使用下方键盘...</div>
+
+    <!-- 方式2：文本框 (Edge/微信浏览器推荐) -->
+    <div class="input-group">
+        <input type="text" id="manual-input" placeholder="点击此处，使用键盘语音输入...">
+        <button id="send-btn" onclick="sendManualText()">发送指令</button>
+    </div>
+
+    <script>
+        // --- 方式1: Web Speech API 逻辑 ---
+        let recognition = null;
+        try {
+            recognition = new (window.SpeechRecognition || window.webkitSpeechRecognition)();
+            recognition.lang = 'zh-CN';
+            recognition.onresult = function(event) {
+                let txt = event.results[0][0].transcript;
+                document.getElementById('status').innerText = "识别: " + txt;
+                sendToServer(txt); // 识别成功直接发送
+            };
+            recognition.onerror = function(e) {
+                document.getElementById('status').innerText = "浏览器不支持API，请用下方键盘输入";
+            };
+        } catch(e) {
+            document.getElementById('status').innerText = "当前浏览器不支持语音API";
+        }
+
+        function startRec() { if(recognition) recognition.start(); document.getElementById('status').innerText = "👂 正在聆听..."; }
+        function stopRec() { if(recognition) recognition.stop(); }
+
+        // --- 方式2: 文本框手动发送逻辑 ---
+        function sendManualText() {
+            let txt = document.getElementById('manual-input').value;
+            if(txt) {
+                sendToServer(txt);
+                document.getElementById('manual-input').value = ''; // 清空
+            }
+        }
+
+        // --- 公共发送函数 ---
+        function sendToServer(text) {
+            document.getElementById('status').innerText = "🚀 发送指令: " + text;
+            fetch('/send_cmd', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                body: 'text=' + encodeURIComponent(text)
+            });
+        }
+    </script>
+</body>
+</html>
+"""
+
+@app.route('/')
+def index(): 
+    return render_template_string(HTML_TEMPLATE)
+
+@app.route('/send_cmd', methods=['POST'])
+def receive_cmd():
+    text = request.form.get('text')
+    if text:
+        print(f"\n📱 收到手机语音指令: [{text}]")
+        cmd_queue.put(text)  # 将指令放入队列
+    return "OK"
+
+def run_flask():
+    # 运行在 0.0.0.0 让局域网手机可以访问
+    app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
+
+# ================= 🧠 大模型视觉识别函数 =================
+def ask_ai_what_is_this(cv2_img, prompt_obj_name):
+    """
+    裁剪出的物体图片 -> 发送给阿里云 Qwen-VL -> 判断是否是目标物体
+    """
+    import os
+    if not os.path.exists('ai_debug'): os.makedirs('ai_debug')
+    filename = f"ai_debug/{int(time.time())}.jpg"
+    cv2.imwrite(filename, cv2_img)
+    print(f"📸 已将发送给AI的切片保存至: {filename}")
+
+    try:
+        # 1. 图像转 Base64
+        _, buffer = cv2.imencode('.jpg', cv2_img)
+        img_b64 = base64.b64encode(buffer).decode('utf-8')
+        img_data = f"data:image/jpeg;base64,{img_b64}"
+
+        # 2. 构建 Prompt：让 AI 判断物体是否符合描述
+        prompt = f"""
+        用户的指令是：“{prompt_obj_name}”。
+        请判断这张图片中的物体，是否是用户指令中想要获取的目标？
+        请只回答"是"或"否"。
+        例如，如果用户说"抓取红色的苹果"，而图片中确实是一个红色的苹果，你应该回答"是"。如果图片中是一个绿色的苹果，或者是一个红色的球，你都应该回答"否"。
+        """
+
+        # 3. 调用 Qwen-VL-Plus
+        response = dashscope.MultiModalConversation.call(
+            model='qwen3-vl-plus',  # 使用阿里最强的视觉模型
+            messages=[{
+                'role': 'user',
+                'content': [
+                    {'image': img_data},
+                    {'text': prompt}
+                ]
+            }],
+            api_key=DASHSCOPE_API_KEY
+        )
+
+        if response.status_code == HTTPStatus.OK:
+            answer = response.output.choices[0].message.content[0]['text']
+            print(f"🤖 AI 分析结果: {answer}")
+            return "是" in answer
+        else:
+            print(f"API Error: {response.message}")
+            return False
+    except Exception as e:
+        print(f"AI 请求失败: {e}")
+        return False
+
+# ================= 🦴 骨架化抓取点检测函数（修改版）=================
+def get_skeleton_grasp_pose_advanced(mask_uint8, max_width=GRIPPER_MAX_WIDTH_PIXELS, sample_step=SKELETON_SAMPLE_STEP):
+    """
+    高级骨架化抓取点检测算法（简化版，不返回角度）
+    参数:
+        mask_uint8: 二值掩码图像 (0-255)
+        max_width: 机械爪最大开合度（像素）
+        sample_step: 骨架采样步长
+    返回:
+        (grasp_x, grasp_y), skeleton_img, local_width 或 None（失败时）
+    """
+    try:
+        from skimage.morphology import skeletonize
+        
+        # 1. 二值化掩码
+        binary = mask_uint8 > 0
+        
+        # 2. 提取骨架
+        skeleton = skeletonize(binary)
+        
+        # 将骨架转换为uint8图像用于显示
+        skeleton_img = (skeleton * 255).astype(np.uint8)
+        
+        # 3. 获取骨架点坐标
+        skel_coords = np.argwhere(skeleton)  # 返回 [[y, x], ...]
+        
+        if len(skel_coords) < 3:
+            # 骨架点太少，使用简单策略
+            return get_skeleton_grasp_pose_simple(mask_uint8)
+        
+        # 4. 计算掩码质心
+        moments = cv2.moments(mask_uint8)
+        if moments['m00'] == 0:
+            centroid = np.array([mask_uint8.shape[1]//2, mask_uint8.shape[0]//2])
+        else:
+            centroid = np.array([moments['m10']/moments['m00'], moments['m01']/moments['m00']])
+        
+        # 5. 对骨架点进行采样
+        sampled_points = []
+        for i in range(0, len(skel_coords), sample_step):
+            y, x = skel_coords[i]
+            sampled_points.append((x, y, i))  # (x, y, 原始索引)
+        
+        # 6. 检测每个采样点的局部宽度
+        valid_points = []
+        for x, y, idx in sampled_points:
+            # 计算切线方向（使用相邻点）
+            prev_idx = max(0, idx - 5)
+            next_idx = min(len(skel_coords) - 1, idx + 5)
+            
+            if prev_idx == next_idx:
+                continue
+                
+            # 获取前后点计算切线
+            p1 = skel_coords[prev_idx]  # [y, x]
+            p2 = skel_coords[next_idx]  # [y, x]
+            
+            # 计算切线角度（用于宽度测量）
+            dx = p2[1] - p1[1]
+            dy = p2[0] - p1[0]
+            
+            if dx == 0 and dy == 0:
+                continue
+                
+            tangent_angle = math.atan2(dy, dx)
+            normal_angle = tangent_angle + math.pi/2  # 法线方向
+            
+            # 沿法线方向检测宽度
+            local_width = measure_width_along_normal(mask_uint8, x, y, normal_angle)
+            
+            if local_width > 0 and local_width <= max_width:
+                # 计算到质心的距离
+                dist_to_centroid = math.hypot(x - centroid[0], y - centroid[1])
+                valid_points.append({
+                    'point': (x, y),
+                    'width': local_width,
+                    'dist_to_centroid': dist_to_centroid,
+                })
+        
+        # 7. 选择最优抓取点
+        if not valid_points:
+            # 没有符合条件的点，使用简单策略
+            return get_skeleton_grasp_pose_simple(mask_uint8)
+        
+        # 策略：优先选择距离质心近的点
+        valid_points.sort(key=lambda p: p['dist_to_centroid'])
+        best = valid_points[0]
+        
+        return best['point'], skeleton_img, best['width']
+        
+    except Exception as e:
+        # 只在真正出错时打印，避免刷屏
+        return None
+
+def get_skeleton_grasp_pose_simple(mask_uint8):
+    """
+    简单骨架化策略（返回骨架图像）
+    """
+    try:
+        from skimage.morphology import skeletonize
+        
+        binary = mask_uint8 > 0
+        skeleton = skeletonize(binary)
+        skeleton_img = (skeleton * 255).astype(np.uint8)
+        
+        skel_coords = np.argwhere(skeleton)
+        
+        if len(skel_coords) == 0:
+            return None
+            
+        middle_idx = len(skel_coords) // 2
+        target_y, target_x = skel_coords[middle_idx]
+        
+        return (int(target_x), int(target_y)), skeleton_img, 0
+    except:
+        return None
+
+def measure_width_along_normal(mask_uint8, x, y, normal_angle, max_search=100):
+    """
+    沿法线方向测量局部宽度
+    """
+    height, width = mask_uint8.shape
+    
+    # 法线方向向量
+    nx = math.cos(normal_angle)
+    ny = math.sin(normal_angle)
+    
+    # 向两侧搜索边界
+    def find_boundary(dx_dir, dy_dir):
+        step = 0
+        while step < max_search:
+            check_x = int(x + dx_dir * step)
+            check_y = int(y + dy_dir * step)
+            
+            if check_x < 0 or check_x >= width or check_y < 0 or check_y >= height:
+                return step
+            
+            if mask_uint8[check_y, check_x] == 0:
+                return step - 1 if step > 0 else 0
+                
+            step += 1
+        return max_search
+    
+    # 正反方向搜索
+    dist1 = find_boundary(nx, ny)
+    dist2 = find_boundary(-nx, -ny)
+    
+    return dist1 + dist2
+
+# ================= 📷 相机类 (增加报错透传与重试机制) =================
+class AsyncAstraCamera:
+    def __init__(self, lib_path):
+        self.valid = False
+        self.running = False
+        self.color_frame = None
+        self.depth_frame = None
+        self.lock = threading.Lock()
+        self.thread = None
+        
+        for i in range(3):
+            try:
+                try: openni2.unload()
+                except: pass
+                
+                openni2.initialize(lib_path)
+                self.dev = openni2.Device.open_any()
+                
+                self.color_stream = self.dev.create_color_stream()
+                self.depth_stream = self.dev.create_depth_stream()
+                self.dev.set_image_registration_mode(openni2.IMAGE_REGISTRATION_DEPTH_TO_COLOR)
+                self.dev.set_image_registration_mode(openni2.IMAGE_REGISTRATION_DEPTH_TO_COLOR)
+                
+                self.color_stream.start()
+                self.depth_stream.start()
+                
+                self.valid = True
+                self.running = True
+                self.thread = threading.Thread(target=self._update_frames, daemon=True)
+                self.thread.start()
+                print("✅ Astra相机初始化成功，等待画面流入...")
+                break
+            except Exception as e:
+                print(f"⚠️ 初始化失败: {e}")
+                time.sleep(1.5)
+
+        if not self.valid:
+            print("❌ 错误：无法连接相机。")
+
+    def _update_frames(self):
+        print("🎥 相机取流后台线程已启动...")
+        error_count = 0
+        while self.running:
+            try:
+                c = self.color_stream.read_frame()
+                d = self.depth_stream.read_frame()
+                c_img = np.frombuffer(c.get_buffer_as_uint8(), dtype=np.uint8).reshape(c.height, c.width, 3)
+                c_img = cv2.cvtColor(c_img, cv2.COLOR_RGB2BGR)
+                d_img = np.frombuffer(d.get_buffer_as_uint16(), dtype=np.uint16).reshape(d.height, d.width)
+                with self.lock:
+                    self.color_frame = c_img
+                    self.depth_frame = d_img
+                error_count = 0 # 成功读取，重置错误计数
+            except Exception as e:
+                error_count += 1
+                if error_count % 30 == 0:  # 防止刷屏，每隔一段时间打印一次
+                    print(f"⚠️ 警告：相机未能传输画面数据 (可能USB供电不足) -> {e}")
+            time.sleep(0.01)
+
+    def get_frames(self):
+        with self.lock:
+            if self.color_frame is not None:
+                return self.color_frame.copy(), self.depth_frame.copy()
+            return None, None
+
+    def stop(self):
+        self.running = False
+        if self.thread: self.thread.join(timeout=1)
+        try:
+            openni2.unload()
+        except: pass
+
+# ================= 🎛️ 新增：校正参数全局变量 =================
+# X, Y, Z 轴的偏移校正量
+offset_x = 0
+offset_y = 0
+offset_z = 0
+last_z_error = 0.0  # 最后计算的Z轴自动校正值
+
+# ================= 📐 坐标与深度计算 (鲁棒性升级，集成Z轴自动校正) =================
+def get_robust_region_depth(depth_img, x, y, radius=4):
+    """带抗噪滤波的深度提取"""
+    h, w = depth_img.shape
+    y_min, y_max = max(0, int(y-radius)), min(h, int(y+radius+1))
+    x_min, x_max = max(0, int(x-radius)), min(w, int(x+radius+1))
+    roi = depth_img[y_min:y_max, x_min:x_max]
+    
+    valid = roi[roi > 0]
+    if len(valid) > 3:
+        # 去除极值噪点，取中位数附近的均值
+        p20, p80 = np.percentile(valid, 20), np.percentile(valid, 80)
+        filtered = valid[(valid >= p20) & (valid <= p80)]
+        return np.mean(filtered) if len(filtered) > 0 else np.median(valid)
+    return 0
+
+def pixel_to_robot_xyz(u, v, depth_frame):
+    """像素坐标转机械臂坐标（集成Z轴自动校正）"""
+    global matrix_pixel_to_world, base_pos_world, table_depth_val
+    global offset_x, offset_y, offset_z, last_z_error
+    
+    if matrix_pixel_to_world is None or depth_frame is None:
+        return None
+    
+    vec = np.array([[[u, v]]], dtype=np.float32)
+    world_pos = cv2.perspectiveTransform(vec, matrix_pixel_to_world)[0][0]
+    raw_x = world_pos[0] - base_pos_world[0]  # 原始X坐标（未加偏移）
+    raw_y = world_pos[1] - base_pos_world[1]  # 原始Y坐标（未加偏移）
+    
+    obj_depth_mm = get_robust_region_depth(depth_frame, u, v)
+    if obj_depth_mm > 0 and table_depth_val > 0:
+        obj_height_cm = (table_depth_val - obj_depth_mm) / 10.0
+        rob_z = max(TABLE_BASE_Z, TABLE_BASE_Z + obj_height_cm)
+    else:
+        rob_z = TABLE_BASE_Z+6.0  # 默认高度，避免过低
+    
+    # 🔧 应用Z轴自动校正（基于原始坐标）
+    if coefficients is not None:
+        z_error = compute_z_error(raw_x, raw_y)
+        rob_z -= z_error  # 减去系统误差
+        # 保存校正值用于显示
+        last_z_error = z_error
+    
+    # 添加手动偏移
+    rob_z += offset_z
+    rob_x = raw_x + offset_x
+    rob_y = raw_y + offset_y
+    
+    return rob_x, rob_y, rob_z
+
+# ================= 🤖 机械臂控制 (带重试机制) =================
+http_session = requests.Session()
+
+def blocking_send(x, y, z, claw, t=1000, max_retries=3):
+    """带重试机制的机械臂指令发送"""
+    params = {'x': round(float(x), 2), 'y': round(float(y), 2), 
+              'z': round(float(z), 2), 'c': int(claw), 't': int(t)}
+    timeout_val = (t / 1000.0) + 1.0 
+    
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = http_session.get(ROBOT_URL, params=params, timeout=timeout_val)
+            if resp.status_code == 200:
+                return True
+        except requests.exceptions.RequestException:
+            print(f"[通信警告] 指令 {params} 超时，正在重试 ({attempt}/{max_retries})...")
+            time.sleep(0.2)
+    return False
+
+def grab_sequence(rx, ry, rz):
+    """执行完整的抓取序列"""
+    global robot_busy
+    robot_busy = True
+    OPEN, CLOSE = 100, 6
+    print(f"\n🚀 开始执行 3D 抓取: X:{rx:.1f} Y:{ry:.1f} Z:{rz:.1f}")
+    
+    steps = [
+        ("悬停对准", rx, -ry, HOVER_Z, OPEN, 1200),
+        ("下降抓取", rx, -ry, rz, OPEN, 800),
+        ("闭合机械爪", rx, -ry, rz, CLOSE, 500),
+        ("垂直拉升", rx, -ry, HOVER_Z, CLOSE, 800),
+        ("移动至投放点", 15.0, -15.0, HOVER_Z, CLOSE, 1200),
+        ("松开物体", 15.0, -15.0, HOVER_Z, OPEN, 500),
+        ("归位待命", 5.0, 0.0, HOVER_Z, OPEN, 1000)
+    ]
+    
+    for action, x, y, z, c, t in steps:
+        print(f" > {action}...")
+        if not blocking_send(x, y, z, c, t):
+            print("!!! 严重错误：重试失败，动作序列被强制终止。")
+            break
+        # 守护线程中的延时，不会卡死主界面的摄像头和识别
+        time.sleep((t / 1000.0) + 0.1) 
+    
+    print("✅ 抓取流程结束\n")
+    robot_busy = False
+
+# ================= 🔍 智能搜索函数 (整合第三段代码) =================
+def smart_search_and_grab(user_command, color_frame, depth_frame, masks_list):
+    """
+    智能搜索逻辑：
+    1. 数量检测：如果是0个，直接报错。
+    2. 预处理：过滤小物体，按距离中心排序。
+    3. 逐个询问：调用大模型，一旦确认，立即抓取并停止。
+    """
+    global robot_busy
+    
+    if robot_busy:
+        print("⚠️ 机械臂正忙，请等待当前任务完成")
+        return
+    
+    # --- 1. 判空处理 ---
+    if len(masks_list) == 0:
+        print("👀 画面空空如也，没看到任何能抓的东西！")
+        return
+
+    print(f"🧐 FastSAM 发现了 {len(masks_list)} 个物体，正在筛选...")
+
+    # 获取画面中心点
+    h, w = color_frame.shape[:2]
+    center_x, center_y = w // 2, h // 2
+
+    # --- 2. 智能排序与过滤 ---
+    candidates = []
+    for obj in masks_list:
+        # 计算面积
+        bbox = obj['bbox']
+        area = bbox[2] * bbox[3]  # 宽 * 高
+        
+        # 过滤1：太小的噪点不要
+        if area < 1500: 
+            continue 
+            
+        # 计算物体中心到画面中心的距离
+        cx, cy = obj['center']
+        dist_to_center = math.hypot(cx - center_x, cy - center_y)
+        
+        # 将整理好的数据存入临时列表
+        candidates.append({
+            'obj': obj,
+            'dist': dist_to_center,
+            'area': area
+        })
+
+    # 排序：优先看离中心最近的物体
+    candidates.sort(key=lambda x: x['dist'])
+
+    print(f"🔍 筛选后剩余 {len(candidates)} 个有效候选物体，开始AI识别...")
+
+    # --- 3. 逐个询问大模型 ---
+    target_obj = None
+    
+    # 限制最大尝试次数
+    max_attempts = min(len(candidates), 10)
+    
+    for i in range(max_attempts):
+        candidate = candidates[i]
+        obj = candidate['obj']
+        
+        # 在屏幕上画框，让用户知道 AI 正在看哪个
+        debug_img = color_frame.copy()
+        x, y, w, h = obj['bbox']
+        cv2.rectangle(debug_img, (x, y), (x+w, y+h), (0, 255, 0), 3)
+        cv2.putText(debug_img, f"Checking #{i+1}...", (x, y-10), 0, 0.8, (0, 255, 0), 2)
+        cv2.imshow("AI_Vision", debug_img)
+        cv2.waitKey(50)  # 稍微停顿展示一下
+
+        # 截取该物体的图片
+        crop_img = obj['crop'] 
+        
+        print(f"🤖 正在分析第 {i+1} 个物体 (距离中心 {int(candidate['dist'])}px)...")
+        
+        # 询问大模型
+        is_match = ask_ai_what_is_this(crop_img, user_command)
+        
+        if is_match:
+            print(f"✅ 找到了！目标锁定：候选物体 #{i+1}")
+            target_obj = obj
+            break  # 找到了就立刻退出循环
+
+    # --- 4. 结果处理 ---
+    if target_obj:
+        # 计算目标坐标（使用抓取点或中心点）
+        if 'grasp_point' in target_obj:
+            cx, cy = target_obj['grasp_point']
+        else:
+            cx, cy = target_obj['center']
+            
+        coords = pixel_to_robot_xyz(cx, cy, depth_frame)
+        
+        if coords:
+            rx, ry, rz = coords
+            # 启动抓取线程
+            threading.Thread(target=grab_sequence, args=(rx, ry, rz), daemon=True).start()
+        else:
+            print("❌ 无法计算目标坐标")
+    else:
+        print("🤷‍♂️ 看了几个最可能的物体，都没找到你要的。请尝试把物体放中间一点，或者说得更清楚些。")
+
+# ================= 🖱️ 鼠标回调函数 (整合标定与手动抓取) =================
+# 全局状态变量
+calib_points = []
+base_point_pixel = None
+base_pos_world = None
+matrix_pixel_to_world = None
+state = 0  # 0:标定中, 1:点击底座, 2:就绪
+table_depth_val = 0
+detected_masks = []
+robot_busy = False
+latest_depth_frame = None
+
+def mouse_callback(event, x, y, flags, param):
+    """鼠标回调：整合标定与手动抓取功能"""
+    global state, calib_points, base_point_pixel, base_pos_world
+    global matrix_pixel_to_world, table_depth_val, robot_busy, latest_depth_frame
+    
+    if event == cv2.EVENT_LBUTTONDOWN:
+        if state == 0:  # 标定阶段：点击A4纸四个角
+            calib_points.append((x, y))
+            print(f"标定点 {len(calib_points)}: ({x}, {y})")
+            if len(calib_points) == 4:
+                pts_src = np.float32(calib_points)
+                pts_dst = np.float32([[0, CALIB_HEIGHT], [0, 0], 
+                                      [CALIB_WIDTH, 0], [CALIB_WIDTH, CALIB_HEIGHT]])
+                matrix_pixel_to_world = cv2.getPerspectiveTransform(pts_src, pts_dst)
+                
+                # 计算桌面基准深度值
+                if latest_depth_frame is not None:
+                    ds = [get_robust_region_depth(latest_depth_frame, p[0], p[1]) for p in calib_points]
+                    valid_ds = [d for d in ds if d > 0]
+                    table_depth_val = np.mean(valid_ds) if valid_ds else 0
+                    print(f"桌面深度基准值: {table_depth_val:.1f} mm")
+                
+                state = 1
+                print("\n>>> 标定纸设定完毕。请点击[机械臂底座]设定原点。")
+                
+        elif state == 1:  # 点击底座原点
+            base_point_pixel = (x, y)
+            vec = np.array([[[x, y]]], dtype=np.float32)
+            base_pos_world = cv2.perspectiveTransform(vec, matrix_pixel_to_world)[0][0]
+            state = 2
+            print(f"\n>>> 系统已完全就绪！底座原点: {base_pos_world}")
+            print(">>> 现在可以：")
+            print("    1. 点击画面中的物体进行手动抓取")
+            print("    2. 使用手机语音控制")
+            
+        elif state == 2 and not robot_busy:  # 就绪状态：手动抓取
+            # 寻找最近的物体
+            best_obj = None
+            min_dist = 50  # 像素距离阈值
+            for obj in detected_masks:
+                # 优先使用抓取点，如果没有则使用中心点
+                if 'grasp_point' in obj:
+                    cx, cy = obj['grasp_point']
+                else:
+                    cx, cy = obj['center']
+                    
+                d = math.hypot(cx - x, cy - y)
+                if d < min_dist:
+                    min_dist, best_obj = d, obj
+            
+            if best_obj:
+                # 计算坐标并抓取
+                if 'grasp_point' in best_obj:
+                    cx, cy = best_obj['grasp_point']
+                else:
+                    cx, cy = best_obj['center']
+                    
+                coords = pixel_to_robot_xyz(cx, cy, latest_depth_frame)
+                if coords:
+                    rx, ry, rz = coords
+                    # 安全检查：防止抓取基座附近的物体
+                    if rx > 5.0:  
+                        threading.Thread(target=grab_sequence, args=(rx, ry, rz), daemon=True).start()
+                    else:
+                        print(">>> ⚠️ 目标太靠近基座，系统拒绝执行以防止碰撞。")
+                else:
+                    print(">>> ❌ 无法计算目标坐标")
+
+def reset_system():
+    """重置系统状态"""
+    global state, calib_points, base_point_pixel, base_pos_world
+    global matrix_pixel_to_world, table_depth_val, detected_masks, robot_busy
+    
+    state = 0
+    calib_points = []
+    base_point_pixel = None
+    base_pos_world = None
+    matrix_pixel_to_world = None
+    table_depth_val = 0
+    detected_masks = []
+    # 注意：不重置 robot_busy，让当前任务完成
+    print("\n[系统复位] 所有标定与坐标系缓存已清空。请重新标定。")
+
+# ================= 🎨 显示函数 (整合HUD) =================
+def draw_hud(frame, state, robot_busy):
+    """绘制HUD面板"""
+    h, w = frame.shape[:2]
+    
+    # 底部半透明黑色面板
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (0, h - 50), (w, h), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
+    
+    # 状态文字
+    if state == 0:
+        msg = "[Step 1] Click 4 corners of A4 paper"
+    elif state == 1:
+        msg = "[Step 2] Click Robot Base Origin"
+    else:
+        msg = "[READY] Click Object to GRAB or use Voice Control"
+    
+    cv2.putText(frame, msg, (15, h - 18), cv2.FONT_HERSHEY_DUPLEX, 0.7, (0, 255, 255), 1, cv2.LINE_AA)
+    
+    # 骨架化状态
+    skeleton_status = "SKEL: ON" if USE_SKELETON_GRASP else "SKEL: OFF"
+    cv2.putText(frame, skeleton_status, (w // 2 + 50, h - 18), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0) if USE_SKELETON_GRASP else (100, 100, 100), 1, cv2.LINE_AA)
+    
+    if robot_busy:
+        cv2.putText(frame, "ARM BUSY", (w - 150, h - 18), cv2.FONT_HERSHEY_DUPLEX, 0.7, (0, 0, 255), 2, cv2.LINE_AA)
+    else:
+        cv2.putText(frame, "ARM IDLE", (w - 150, h - 18), cv2.FONT_HERSHEY_DUPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
+    
+    # 显示检测到的物体数量
+    obj_count = len(detected_masks)
+    cv2.putText(frame, f"Objects: {obj_count}", (w // 2 - 60, h - 18), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
+
+# ================= 🎛️ 新增：校正窗口函数 =================
+def create_calibration_window():
+    """创建坐标校正窗口"""
+    global offset_x, offset_y, offset_z
+    
+    cv2.namedWindow("adjust", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("adjust", 500, 400)
+    
+    # 创建滑动条
+    # X轴偏移 (-10.0cm 到 +10.0cm，步长0.1cm)
+    cv2.createTrackbar("Xoffset(cm)", "adjust", int((offset_x + 10.0) * 10), 200, lambda x: None)
+    # Y轴偏移 (-10.0cm 到 +10.0cm，步长0.1cm)
+    cv2.createTrackbar("Yoffset(cm)", "adjust", int((offset_y + 10.0) * 10), 200, lambda x: None)
+    # Z轴偏移 (-10.0cm 到 +10.0cm，步长0.1cm)
+    cv2.createTrackbar("Zoffset(cm)", "adjust", int((offset_z + 10.0) * 10), 200, lambda x: None)
+    
+    # 恢复默认值按钮
+    print("✅ 校正窗口已创建，可以调节X,Y,Z轴的偏移量")
+
+def update_calibration_values():
+    """从滑动条读取并更新校正值"""
+    global offset_x, offset_y, offset_z
+    
+    try:
+        # 读取滑动条值并转换为浮点数 (滑动条范围0-200对应-10.0到+10.0)
+        offset_x = (cv2.getTrackbarPos("Xoffset(cm)", "adjust") / 10.0) - 10.0
+        offset_y = (cv2.getTrackbarPos("Yoffset(cm)", "adjust") / 10.0) - 10.0
+        offset_z = (cv2.getTrackbarPos("Zoffset(cm)", "adjust") / 10.0) - 10.0
+    except:
+        pass  # 窗口可能还未创建
+
+def draw_calibration_display():
+    """在图片上显示当前的校正值"""
+    global offset_x, offset_y, offset_z, last_z_error
+    line1 = f"offset: X:{offset_x:+.1f}cm Y:{offset_y:+.1f}cm Z:{offset_z:+.1f}cm"
+    line2 = f"auto Z corr: {last_z_error:+.2f}cm"
+    return line1, line2
+
+# ================= 🚀 主程序 (防崩溃优化版，集成Z轴自动校正) =================
+def main():
+    global detected_masks, latest_depth_frame, robot_busy, DEVICE, USE_SKELETON_GRASP
+    
+    # 🌟 优化1：先加载重型 AI 模型，防止后续多线程抢占资源崩溃
+    print("⏳ [步骤 1/3] 正在加载 AI 模型到显卡 (需等待几秒)...")
+    try:
+        model = FastSAM('FastSAM-s.pt')
+        model.to(DEVICE)
+        print(f"✅ FastSAM 模型已成功加载到 ({DEVICE})")
+    except Exception as e:
+        print(f"❌ 模型加载失败: {e}")
+        return
+
+    # 🌟 优化2：启动 Flask 服务器
+    print("⏳[步骤 2/3] 正在启动语音服务器...")
+    threading.Thread(target=run_flask, daemon=True).start()
+    print("📱 语音服务可用: http://192.168.43.5:5000")
+    
+    # 🌟 优化3：最后再启动最容易出错的相机硬件
+    print("⏳ [步骤 3/3] 正在连接 Astra 3D 相机...")
+    cam = AsyncAstraCamera(OPENNI_LIB_PATH)
+    if not cam.valid: 
+        print("\n" + "="*50)
+        print("🚨 致命错误：相机底层死锁！")
+        print("🚨 请立即执行以下操作：")
+        print("🚨 1. 拔掉 Astra 相机的 USB 线。")
+        print("🚨 2. 等待 5 秒钟。")
+        print("🚨 3. 重新插上 USB 线。")
+        print("🚨 4. 再次运行程序。")
+        print("="*50 + "\n")
+        return
+    
+    # 🌟 新增：创建校正窗口
+    create_calibration_window()
+    
+    # 创建主窗口
+    cv2.namedWindow("AI_Vision", cv2.WINDOW_NORMAL)
+    cv2.setMouseCallback("AI_Vision", mouse_callback)
+    cv2.createTrackbar("Conf", "AI_Vision", 65, 95, lambda x: None)
+    
+    print("\n=== ⚡ 系统已全部就绪 ⚡ ===")
+    
+    try:
+        while True:
+            # 1. 窗口安全检查
+            if cv2.getWindowProperty("AI_Vision", cv2.WND_PROP_VISIBLE) < 1: 
+                print("🛑 检测到窗口关闭，准备退出...")
+                break
+            
+            # 更新校正值
+            update_calibration_values()
+            
+            # 2. 获取画面
+            color_img, depth_img = cam.get_frames()
+            if color_img is None:
+                # 创一个黑屏提示用户，而不是卡死窗口
+                black_screen = np.zeros((480, 640, 3), dtype=np.uint8)
+                cv2.putText(black_screen, "Waiting for Camera Signal...", (50, 240), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+                cv2.imshow("AI_Vision", black_screen)
+                
+                key = cv2.waitKey(50)
+                if key == ord('q') or key == 27: break
+                continue
+                
+            latest_depth_frame = depth_img
+            
+            # 3. 运行检测 (当机械臂没在动时)
+            if not robot_busy:
+                try:
+                    conf_thresh = cv2.getTrackbarPos("Conf", "AI_Vision") / 100.0
+                except cv2.error:
+                    conf_thresh = 0.65
+
+                results = model(color_img, device=DEVICE, retina_masks=True, 
+                              conf=conf_thresh, iou=0.8, verbose=False, imgsz=640)
+                
+                detected_masks = []
+                if len(results) > 0 and results[0].masks is not None:
+                    # 1. 获取画面总面积并设定比例限制
+                    img_h, img_w = color_img.shape[:2]
+                    total_area = img_h * img_w
+                    max_area_limit = total_area / 10.0
+                    min_area_limit = total_area / 500.0
+                    
+                    masks = results[0].masks.data.cpu().numpy()
+                    for mask in masks:
+                        # 2. 🎯【过滤机制 1：面积过滤】
+                        if np.sum(mask) > max_area_limit or np.sum(mask) < min_area_limit:
+                            continue
+                            
+                        mask_uint8 = (mask * 255).astype(np.uint8)
+                        
+                        # 计算物体中心点（默认使用距离变换中心）
+                        dist_trans = cv2.distanceTransform(mask_uint8, cv2.DIST_L2, 5)
+                        _, _, _, max_loc = cv2.minMaxLoc(dist_trans)
+                        default_cx, default_cy = max_loc
+                        
+                        # 初始化抓取点为中心点
+                        grasp_cx, grasp_cy = default_cx, default_cy
+                        skeleton_img = None
+                        
+                        if USE_SKELETON_GRASP:
+                            # 尝试使用骨架化方法
+                            skeleton_result = get_skeleton_grasp_pose_advanced(mask_uint8, GRIPPER_MAX_WIDTH_PIXELS)
+                            if skeleton_result:
+                                (grasp_cx, grasp_cy), skeleton_img, local_width = skeleton_result
+                                # 不再打印到控制台，只在图像上显示
+                            else:
+                                # 骨架化失败，使用默认中心点
+                                grasp_cx, grasp_cy = default_cx, default_cy
+                        
+                        # 3. 🎯【过滤机制 2：高度/深度过滤】
+                        if table_depth_val > 0 and depth_img is not None:
+                            obj_depth = get_robust_region_depth(depth_img, grasp_cx, grasp_cy)
+                            
+                            if obj_depth > 0 and obj_depth > (table_depth_val + 15):
+                                continue  # 如果物体比桌面还要低 1.5cm 以上，直接作为噪点丢弃！
+                        
+                        # 经过重重过滤，真正有效的目标才会被记录
+                        contours, _ = cv2.findContours(mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                        if contours:
+                            x, y, w, h = cv2.boundingRect(contours[0])
+                            crop = color_img[y:y+h, x:x+w] if y+h < color_img.shape[0] and x+w < color_img.shape[1] else None
+                            
+                            obj_data = {
+                                'mask': mask_uint8, 
+                                'center': (default_cx, default_cy),  # 原始中心点
+                                'grasp_point': (grasp_cx, grasp_cy),  # 抓取点（可能是骨架化结果）
+                                'bbox': (x, y, w, h), 
+                                'crop': crop
+                            }
+                            
+                            # 保存骨架图像用于显示
+                            if skeleton_img is not None:
+                                obj_data['skeleton'] = skeleton_img
+                                
+                            detected_masks.append(obj_data)
+            
+            # 4. 处理语音指令
+            try:
+                cmd_text = cmd_queue.get_nowait()
+                if state == 2 and not robot_busy and cmd_text:
+                    threading.Thread(target=smart_search_and_grab, 
+                                   args=(cmd_text, color_img, depth_img, detected_masks), 
+                                   daemon=True).start()
+            except queue.Empty:
+                pass
+            
+            # 5. 渲染画面
+            display_img = color_img.copy()
+            
+            # 创建骨架叠加层（半透明）
+            skeleton_overlay = np.zeros_like(display_img)
+            
+            for i, obj in enumerate(detected_masks):
+                # 物体颜色
+                color = ((i*40)%255, (i*80)%255, 255 - (i*30)%255)
+                
+                # 绘制物体轮廓
+                contours, _ = cv2.findContours(obj['mask'], cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                if contours:
+                    cv2.drawContours(display_img, contours, -1, color, 1)
+                
+                # 绘制边界框
+                x, y, w, h = obj['bbox']
+                cv2.rectangle(display_img, (x, y), (x+w, y+h), color, 1)
+                
+                # 如果有骨架图像，叠加显示（半透明青色）
+                if 'skeleton' in obj:
+                    skeleton = obj['skeleton']
+                    # 将骨架转换为彩色
+                    skeleton_color = np.zeros_like(display_img)
+                    skeleton_color[:, :, 0] = 255  # 蓝色通道
+                    skeleton_color[:, :, 1] = 255  # 绿色通道（合成为青色）
+                    skeleton_color[:, :, 2] = 0    # 红色通道
+                    
+                    # 只显示骨架区域
+                    skeleton_mask = skeleton > 0
+                    for c in range(3):
+                        skeleton_overlay[:, :, c] = np.where(skeleton_mask, 
+                                                           skeleton_color[:, :, c], 
+                                                           skeleton_overlay[:, :, c])
+                
+                # 绘制抓取点（红色圆圈）
+                if 'grasp_point' in obj:
+                    gx, gy = obj['grasp_point']
+                    # 红色圆圈标记抓取点
+                    cv2.circle(display_img, (gx, gy), 8, (0, 0, 255), 2)  # 红色外圈
+                    cv2.circle(display_img, (gx, gy), 4, (0, 0, 255), -1)  # 红色实心
+                    
+                    # 计算并显示3D坐标
+                    if state == 2 and depth_img is not None and table_depth_val > 0:
+                        coords = pixel_to_robot_xyz(gx, gy, depth_img)
+                        if coords:
+                            rx, ry, rz = coords
+                            # 在抓取点附近显示3D坐标
+                            coord_text = f"X:{rx:.1f} Y:{ry:.1f} Z:{rz:.1f}"
+                            text_bg_y = gy - 60 if gy > 60 else gy + 20
+                            # 绘制文本背景
+                            text_size = cv2.getTextSize(coord_text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
+                            cv2.rectangle(display_img, 
+                                        (gx - text_size[0]//2 - 5, text_bg_y - text_size[1] - 5),
+                                        (gx + text_size[0]//2 + 5, text_bg_y + 5),
+                                        (0, 0, 0), -1)
+                            # 绘制坐标文本
+                            cv2.putText(display_img, coord_text, 
+                                      (gx - text_size[0]//2, text_bg_y), 
+                                      cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                
+                # 显示物体高度信息（在原始中心点）
+                cx, cy = obj['center']
+                if table_depth_val > 0 and depth_img is not None:
+                    d_mm = get_robust_region_depth(depth_img, cx, cy)
+                    if d_mm > 0:
+                        h_cm = max(0, (table_depth_val - d_mm) / 10.0)
+                        cv2.putText(display_img, f"Z:{h_cm:.1f}cm", (cx-20, cy-15), 
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            
+            # 半透明叠加骨架层
+            if np.any(skeleton_overlay > 0):
+                # 骨架显示为半透明青色
+                cv2.addWeighted(skeleton_overlay, 0.3, display_img, 1.0, 0, display_img)
+            
+            # 绘制标定点
+            for pt in calib_points: 
+                cv2.circle(display_img, pt, 6, (255, 255, 0), -1)
+            
+            # 绘制底座原点
+            if base_point_pixel: 
+                cv2.drawMarker(display_img, base_point_pixel, (255, 0, 255), cv2.MARKER_CROSS, 20, 3)
+            
+            # 添加校正值显示
+            calib_line1, calib_line2 = draw_calibration_display()
+            cv2.putText(display_img, calib_line1, (15, 30), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+            cv2.putText(display_img, calib_line2, (15, 55), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+            
+            draw_hud(display_img, state, robot_busy)
+            cv2.imshow("AI_Vision", display_img)
+            
+            # 显示校正窗口
+            if cv2.getWindowProperty("adjust", cv2.WND_PROP_VISIBLE) >= 1:
+                # 创建校正窗口显示图像
+                calib_display = np.zeros((200, 500, 3), dtype=np.uint8)
+                calib_display[:] = (40, 40, 40)  # 深灰色背景
+                
+                # 显示当前值
+                text = f"Xoffset: {offset_x:+.1f} cm"
+                cv2.putText(calib_display, text, (20, 40), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+                
+                text = f"Yoffset: {offset_y:+.1f} cm"
+                cv2.putText(calib_display, text, (20, 80), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+                
+                text = f"Zoffset: {offset_z:+.1f} cm"
+                cv2.putText(calib_display, text, (20, 120), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+                
+                cv2.putText(calib_display, "adjust offsets", (20, 170), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+                
+                cv2.imshow("adjust", calib_display)
+            
+            key = cv2.waitKey(1)
+            if key == ord('q') or key == 27: break
+            elif key == ord('r'): reset_system()
+            elif key == ord('s'):  # 切换骨架化开关
+                USE_SKELETON_GRASP = not USE_SKELETON_GRASP
+                print(f"切换骨架化: {'ON' if USE_SKELETON_GRASP else 'OFF'}")
+
+    finally:
+        print("\n[安全退出] 正在清理所有硬件资源...")
+        try:
+            cam.stop()
+        except:
+            pass
+        cv2.destroyAllWindows()
+        print("👋 程序已安全退出")
+
+if __name__ == "__main__":
+    main()
