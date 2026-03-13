@@ -7,19 +7,19 @@ import threading
 import torch
 import base64
 import queue
-from flask import Flask, render_template_string, request
+from flask import Flask, render_template_string, request, jsonify
 from openni import openni2
 from ultralytics import FastSAM
 from http import HTTPStatus
 import dashscope  # 阿里通义千问 SDK
 
 # ================= 🔧 配置区域 =================
-OPENNI_LIB_PATH = r'yourpath' 
-ARM_IP = "......"  #your esp32ip
+OPENNI_LIB_PATH = r'D:\Astra mini s\OpenNI_2.3.0.86_202210111950_4c8f5aa4_beta6_windows_x64\OpenNI_2.3.0.86_202210111950_4c8f5aa4_beta6_windows\Win64-Release\tools\NiViewer' 
+ARM_IP = "192.168.43.10"
 ROBOT_URL = f"http://{ARM_IP}/robot"
 
 # 阿里云 DashScope API Key
-DASHSCOPE_API_KEY = "......"  # 请替换为你的API Key
+DASHSCOPE_API_KEY = "..."  # 请替换为你的API Key
 
 # 机械臂参数
 TABLE_BASE_Z = 3.5  # 桌面高度（单位：cm），抓取时Z轴不能低于这个值
@@ -30,6 +30,8 @@ CALIB_HEIGHT = 29.7
 GRIPPER_MAX_WIDTH_PIXELS = 100    # 机械爪最大开合度（像素），根据实际调整
 USE_SKELETON_GRASP = True         # 是否启用骨架化抓取
 SKELETON_SAMPLE_STEP = 10         # 骨架采样步长
+PREGRAB_SAMPLE_COUNT = 16         # 初始化阶段预抓取校准次数
+ENABLE_LEGACY_Z_CORRECTION = False
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
@@ -38,7 +40,7 @@ print(f"🚀 整合版机械臂视觉系统启动 | 设备: {DEVICE}")
 # ================= 📊 Z轴自动校正拟合 =================
 # 用户提供的标定数据集 (x, y, z) 单位：cm
 # 第一行 (16.4, -2.9, 9.1) 为标准参考点
-CALIBRATION_DATA = [    #替换为你的误差测量
+CALIBRATION_DATA = [
     (16.4, -2.9, 9.1),   # 标准数据，正常抓取
     (8.0, -1.7, 9.1),
     (25.5, -2.7, 9.1),
@@ -109,6 +111,307 @@ def compute_z_error(x, y):
              coefficients[5] * x * y)
     return error
 
+
+# -------------------------------------------------------------
+# 🛠️ 校准辅助函数（多项式拟合）
+# -------------------------------------------------------------
+
+def _to_xyz_array(values):
+    return np.asarray(values, dtype=np.float64)
+
+
+def build_success_xyz(raw_xyz, offset_xyz):
+    """根据用户输入的偏移量计算可成功抓取坐标。"""
+    return tuple((_to_xyz_array(raw_xyz) + _to_xyz_array(offset_xyz)).tolist())
+
+
+def compute_modified_zscores(values):
+    """基于MAD计算鲁棒z-score。"""
+    values = np.asarray(values, dtype=np.float64)
+    if values.ndim == 1:
+        values = values[:, None]
+    median = np.median(values, axis=0)
+    mad = np.median(np.abs(values - median), axis=0)
+    mad = np.where(mad < 1e-6, 1.0, mad)
+    return 0.6745 * (values - median) / mad
+
+
+def filter_calibration_samples(samples):
+    """过滤明显异常的偏移输入，避免污染映射模型。"""
+    if len(samples) <= 4:
+        return samples, np.arange(len(samples))
+
+    offsets = np.array([sample['offset_xyz'] for sample in samples], dtype=np.float64)
+    scores = np.abs(compute_modified_zscores(offsets))
+    mask = np.all(scores < 3.5, axis=1)
+
+    if np.count_nonzero(mask) < max(8, len(samples) // 2):
+        mask = np.ones(len(samples), dtype=bool)
+
+    kept_indices = np.nonzero(mask)[0]
+    filtered = [samples[index] for index in kept_indices]
+    return filtered, kept_indices
+
+
+def build_polynomial_features(points):
+    """为三维坐标构造二次多项式特征。"""
+    points = np.asarray(points, dtype=np.float64)
+    x = points[:, 0]
+    y = points[:, 1]
+    z = points[:, 2]
+    return np.column_stack([
+        np.ones(len(points)),
+        x, y, z,
+        x * x, y * y, z * z,
+        x * y, x * z, y * z,
+    ])
+
+
+def fit_ridge_mapping(raw_points, success_points, ridge_alpha=1e-3):
+    """使用带L2正则的二次多项式做回退拟合。"""
+    features = build_polynomial_features(raw_points)
+    eye = np.eye(features.shape[1], dtype=np.float64)
+    eye[0, 0] = 0.0
+    try:
+        coeffs = np.linalg.solve(features.T @ features + ridge_alpha * eye, features.T @ success_points)
+    except np.linalg.LinAlgError:
+        coeffs, *_ = np.linalg.lstsq(features, success_points, rcond=None)
+    predictions = features @ coeffs
+    return {
+        'type': 'ridge',
+        'coeffs': coeffs,
+        'ridge_alpha': ridge_alpha,
+        'predictions': predictions,
+    }
+
+
+def fit_success_mapping_model():
+    """基于 raw_xyz -> success_xyz 拟合映射模型。"""
+    global calibration_model, calibration_model_summary, offset_coeffs_x, offset_coeffs_y, offset_coeffs_z
+
+    if len(calibration_samples) < PREGRAB_SAMPLE_COUNT:
+        calibration_model = None
+        calibration_model_summary = f"样本不足 {len(calibration_samples)}/{PREGRAB_SAMPLE_COUNT}"
+        return False
+
+    filtered_samples, kept_indices = filter_calibration_samples(calibration_samples)
+    raw_points = np.array([sample['raw_xyz'] for sample in filtered_samples], dtype=np.float64)
+    success_points = np.array([sample['success_xyz'] for sample in filtered_samples], dtype=np.float64)
+
+    if len(raw_points) < 8:
+        calibration_model = None
+        calibration_model_summary = f"有效样本不足: {len(raw_points)}/{len(calibration_samples)}"
+        return False
+
+    model = None
+    predictions = None
+    try:
+        from scipy.interpolate import RBFInterpolator
+
+        offset_norm = np.linalg.norm(success_points - raw_points, axis=1)
+        smoothing = max(0.05, float(np.median(offset_norm)) * 0.05)
+        models = [
+            RBFInterpolator(raw_points, success_points[:, axis], kernel='thin_plate_spline', smoothing=smoothing)
+            for axis in range(3)
+        ]
+        predictions = np.column_stack([
+            models[axis](raw_points).reshape(-1) for axis in range(3)
+        ])
+        model = {
+            'type': 'rbf',
+            'models': models,
+            'smoothing': smoothing,
+            'predictions': predictions,
+        }
+    except Exception as error:
+        print(f"⚠️ RBF拟合不可用，回退到Ridge模型: {error}")
+        model = fit_ridge_mapping(raw_points, success_points)
+        predictions = model['predictions']
+
+    residuals = np.linalg.norm(predictions - success_points, axis=1)
+    calibration_model = {
+        **model,
+        'raw_points': raw_points,
+        'success_points': success_points,
+        'kept_indices': kept_indices.tolist(),
+        'mean_residual': float(np.mean(residuals)),
+        'max_residual': float(np.max(residuals)),
+        'valid_count': int(len(raw_points)),
+        'total_count': int(len(calibration_samples)),
+    }
+    calibration_model_summary = (
+        f"{calibration_model['type'].upper()} ready | valid {calibration_model['valid_count']}/"
+        f"{calibration_model['total_count']} | mean {calibration_model['mean_residual']:.2f}cm | "
+        f"max {calibration_model['max_residual']:.2f}cm"
+    )
+
+    offset_coeffs_x = None
+    offset_coeffs_y = None
+    offset_coeffs_z = None
+    print(f"✅ 校准映射模型已更新: {calibration_model_summary}")
+    return True
+
+
+def apply_calibrated_mapping(raw_xyz):
+    """把原始抓取坐标映射到成功抓取坐标。"""
+    global calibration_model
+
+    mapped_xyz = _to_xyz_array(raw_xyz)
+    if calibration_model is not None:
+        query = mapped_xyz.reshape(1, -1)
+        if calibration_model['type'] == 'rbf':
+            mapped_xyz = np.array([
+                calibration_model['models'][axis](query).reshape(-1)[0] for axis in range(3)
+            ], dtype=np.float64)
+        else:
+            mapped_xyz = build_polynomial_features(query) @ calibration_model['coeffs']
+            mapped_xyz = mapped_xyz.reshape(-1)
+
+    mapped_xyz = mapped_xyz + np.array([offset_x, offset_y, offset_z], dtype=np.float64)
+    return tuple(mapped_xyz.tolist())
+
+
+def get_calibration_status_payload():
+    """返回当前校准阶段状态给网页和HUD使用。"""
+    with calibration_lock:
+        pending_raw = None
+        if pending_calibration_sample is not None:
+            pending_raw = [round(v, 2) for v in pending_calibration_sample['raw_xyz']]
+
+        return {
+            'active': calibrating,
+            'waiting_feedback': calibration_waiting_feedback,
+            'feedback_pending': calibration_feedback_pending,
+            'count': calibration_count,
+            'target': PREGRAB_SAMPLE_COUNT,
+            'message': calibration_status_text,
+            'pending_raw_xyz': pending_raw,
+            'model_ready': calibration_model is not None,
+            'model_summary': calibration_model_summary,
+        }
+
+
+def start_pregrab_calibration():
+    """进入初始化阶段的16次预抓取校准模式。"""
+    global state, calibrating, calibration_count, calibration_samples
+    global pending_calibration_sample, calibration_waiting_feedback, calibration_feedback_pending
+    global calibration_status_text, calibration_model, calibration_model_summary
+
+    with calibration_lock:
+        state = 2
+        calibrating = True
+        calibration_count = 0
+        calibration_samples = []
+        pending_calibration_sample = None
+        calibration_waiting_feedback = False
+        calibration_feedback_pending = False
+        calibration_status_text = "初始化校准中：点击目标，执行第 1/16 次预抓取。"
+        calibration_model = None
+        calibration_model_summary = "未拟合"
+
+
+def enqueue_calibration_feedback(dx, dy, dz):
+    global calibration_feedback_pending
+    with calibration_lock:
+        calibration_feedback_pending = True
+    calibration_feedback_queue.put((float(dx), float(dy), float(dz)))
+
+
+def finish_pregrab_calibration():
+    """完成16次预抓取并切换到正常工作状态。"""
+    global state, calibrating, calibration_waiting_feedback, calibration_status_text
+    state = 3
+    calibrating = False
+    calibration_waiting_feedback = False
+    calibration_status_text = "校准完成，系统已进入正常抓取模式。"
+
+
+def submit_calibration_feedback(dx, dy, dz):
+    """接收一次预抓取反馈并更新映射模型。"""
+    global calibration_count, pending_calibration_sample, calibration_waiting_feedback
+    global calibration_status_text, calibration_feedback_pending
+
+    with calibration_lock:
+        calibration_feedback_pending = False
+        if pending_calibration_sample is None:
+            return False, "当前没有等待反馈的预抓取样本。"
+
+        offset_xyz = (float(dx), float(dy), float(dz))
+        raw_xyz = tuple(pending_calibration_sample['raw_xyz'])
+        success_xyz = build_success_xyz(raw_xyz, offset_xyz)
+        sample = {
+            **pending_calibration_sample,
+            'offset_xyz': offset_xyz,
+            'success_xyz': success_xyz,
+            'submitted_at': time.time(),
+        }
+        calibration_samples.append(sample)
+        calibration_count = len(calibration_samples)
+        pending_calibration_sample = None
+        calibration_waiting_feedback = False
+
+        print(
+            f"📍 校准样本 {calibration_count}/{PREGRAB_SAMPLE_COUNT} | raw={tuple(round(v, 2) for v in raw_xyz)} "
+            f"offset={tuple(round(v, 2) for v in offset_xyz)} success={tuple(round(v, 2) for v in success_xyz)}"
+        )
+
+        if calibration_count >= PREGRAB_SAMPLE_COUNT:
+            fitted = fit_success_mapping_model()
+            if fitted:
+                finish_pregrab_calibration()
+                return True, calibration_status_text
+            calibration_status_text = "16次样本已完成，但拟合失败，请按 r 重置后重试。"
+            return False, calibration_status_text
+
+        calibration_status_text = (
+            f"已记录 {calibration_count}/{PREGRAB_SAMPLE_COUNT} 次。点击下一个目标继续预抓取。"
+        )
+        return True, calibration_status_text
+
+
+def handle_calibration_feedback_queue():
+    """在主循环中处理网页提交的偏移反馈。"""
+    processed = False
+    while True:
+        try:
+            dx, dy, dz = calibration_feedback_queue.get_nowait()
+        except queue.Empty:
+            break
+
+        processed = True
+        ok, message = submit_calibration_feedback(dx, dy, dz)
+        prefix = "✅" if ok else "⚠️"
+        print(f"{prefix} {message}")
+    return processed
+
+
+def launch_calibration_pregrab(raw_xyz, click_point, object_point):
+    """执行一次校准预抓取，抓完后等待网页输入偏移量。"""
+    global pending_calibration_sample, calibration_waiting_feedback
+    global calibration_status_text, calibration_feedback_pending
+
+    raw_xyz = tuple(float(v) for v in raw_xyz)
+    grab_sequence(*raw_xyz)
+
+    with calibration_lock:
+        pending_calibration_sample = {
+            'index': len(calibration_samples) + 1,
+            'raw_xyz': raw_xyz,
+            'click_point': tuple(int(v) for v in click_point),
+            'object_point': tuple(int(v) for v in object_point),
+            'captured_at': time.time(),
+        }
+        calibration_waiting_feedback = True
+        calibration_feedback_pending = False
+        calibration_status_text = (
+            f"第 {pending_calibration_sample['index']}/{PREGRAB_SAMPLE_COUNT} 次预抓取已完成，请在网页输入 dx dy dz。"
+        )
+        print(
+            f"📝 等待输入第 {pending_calibration_sample['index']}/{PREGRAB_SAMPLE_COUNT} 次偏移，"
+            f"raw_xyz={tuple(round(v, 2) for v in raw_xyz)}"
+        )
+
+
 # 测试拟合效果（可选）
 if coefficients is not None:
     print("📊 拟合效果验证:")
@@ -120,6 +423,7 @@ if coefficients is not None:
 # ================= 🌐 Flask 语音控制服务器 =================
 app = Flask(__name__)
 cmd_queue = queue.Queue()  # 存放手机发来的指令
+calibration_feedback_queue = queue.Queue()
 
 # 手机端 HTML 界面
 HTML_TEMPLATE = """
@@ -153,6 +457,24 @@ HTML_TEMPLATE = """
             background: #00bcd4; color: white; font-weight: bold; cursor: pointer;
         }
 
+        .panel {
+            max-width: 720px; margin: 24px auto 0; padding: 18px;
+            border-radius: 14px; background: rgba(255, 255, 255, 0.05);
+            border: 1px solid rgba(255, 255, 255, 0.08); text-align: left;
+        }
+        .panel h3 { margin-top: 0; }
+        .panel-row { display: flex; gap: 10px; flex-wrap: wrap; }
+        .panel-row input {
+            flex: 1; min-width: 120px; padding: 10px; border-radius: 8px;
+            border: none; background: #2b2b2b; color: white;
+        }
+        .panel button {
+            padding: 10px 18px; border-radius: 8px; border: none;
+            background: #4caf50; color: white; cursor: pointer;
+        }
+        #calibration-panel.disabled { opacity: 0.45; }
+        #calibration-message, #model-summary { color: #cfcfcf; font-size: 14px; }
+
         #status { margin-top: 20px; color: #888; font-size: 14px; min-height: 24px; }
     </style>
 </head>
@@ -167,6 +489,19 @@ HTML_TEMPLATE = """
     <div class="input-group">
         <input type="text" id="manual-input" placeholder="点击此处，使用键盘语音输入...">
         <button id="send-btn" onclick="sendManualText()">发送指令</button>
+    </div>
+
+    <div class="panel" id="calibration-panel">
+        <h3>初始化校准</h3>
+        <div id="calibration-message">正在获取校准状态...</div>
+        <div id="pending-raw"></div>
+        <div class="panel-row" style="margin-top: 12px;">
+            <input type="number" id="offset-x" step="0.1" placeholder="dx (cm)">
+            <input type="number" id="offset-y" step="0.1" placeholder="dy (cm)">
+            <input type="number" id="offset-z" step="0.1" placeholder="dz (cm)">
+            <button onclick="submitCalibration()">提交偏移</button>
+        </div>
+        <div id="model-summary" style="margin-top: 12px;"></div>
     </div>
 
     <script>
@@ -208,6 +543,56 @@ HTML_TEMPLATE = """
                 body: 'text=' + encodeURIComponent(text)
             });
         }
+
+        async function refreshCalibrationStatus() {
+            try {
+                const response = await fetch('/calibration_status');
+                const data = await response.json();
+                const panel = document.getElementById('calibration-panel');
+                const waiting = data.active && data.waiting_feedback && !data.feedback_pending;
+
+                panel.classList.toggle('disabled', !waiting);
+                document.getElementById('calibration-message').innerText = data.message;
+                document.getElementById('model-summary').innerText = data.model_ready ? data.model_summary : '';
+                document.getElementById('pending-raw').innerText = data.pending_raw_xyz ?
+                    ('等待偏移输入 raw_xyz: ' + data.pending_raw_xyz.join(', ')) :
+                    ('进度: ' + data.count + '/' + data.target);
+            } catch (error) {
+                document.getElementById('calibration-message').innerText = '校准状态获取失败';
+            }
+        }
+
+        async function submitCalibration() {
+            const dx = document.getElementById('offset-x').value;
+            const dy = document.getElementById('offset-y').value;
+            const dz = document.getElementById('offset-z').value;
+            if (dx === '' || dy === '' || dz === '') {
+                document.getElementById('calibration-message').innerText = '请完整输入 dx dy dz';
+                return;
+            }
+
+            const formData = new URLSearchParams();
+            formData.append('dx', dx);
+            formData.append('dy', dy);
+            formData.append('dz', dz);
+
+            const response = await fetch('/submit_calibration', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                body: formData.toString()
+            });
+            const result = await response.json();
+            document.getElementById('calibration-message').innerText = result.message;
+            if (result.ok) {
+                document.getElementById('offset-x').value = '';
+                document.getElementById('offset-y').value = '';
+                document.getElementById('offset-z').value = '';
+            }
+            refreshCalibrationStatus();
+        }
+
+        refreshCalibrationStatus();
+        setInterval(refreshCalibrationStatus, 1000);
     </script>
 </body>
 </html>
@@ -224,6 +609,28 @@ def receive_cmd():
         print(f"\n📱 收到手机语音指令: [{text}]")
         cmd_queue.put(text)  # 将指令放入队列
     return "OK"
+
+@app.route('/calibration_status')
+def calibration_status():
+    return jsonify(get_calibration_status_payload())
+
+@app.route('/submit_calibration', methods=['POST'])
+def submit_calibration_route():
+    try:
+        dx = float(request.form.get('dx', '').strip())
+        dy = float(request.form.get('dy', '').strip())
+        dz = float(request.form.get('dz', '').strip())
+    except ValueError:
+        return jsonify({'ok': False, 'message': '请输入有效的 dx dy dz 浮点数。'}), 400
+
+    status = get_calibration_status_payload()
+    if not status['active'] or not status['waiting_feedback']:
+        return jsonify({'ok': False, 'message': '当前没有等待提交的校准样本。'}), 409
+    if status['feedback_pending']:
+        return jsonify({'ok': False, 'message': '这组偏移已经提交，正在等待程序写入样本。'}), 409
+
+    enqueue_calibration_feedback(dx, dy, dz)
+    return jsonify({'ok': True, 'message': '偏移已提交，正在写入校准样本。'})
 
 def run_flask():
     # 运行在 0.0.0.0 让局域网手机可以访问
@@ -506,6 +913,23 @@ offset_y = 0
 offset_z = 0
 last_z_error = 0.0  # 最后计算的Z轴自动校正值
 
+# 🧮 初始校准相关变量
+calibrating = False              # 当前是否处于初始抓取校准阶段
+calibration_count = 0            # 已完成的校准抓取次数
+calibration_max = PREGRAB_SAMPLE_COUNT
+calibration_samples = []         # 采集的校准数据 [{raw_xyz, offset_xyz, success_xyz, ...}, ...]
+pending_calibration_sample = None
+calibration_waiting_feedback = False
+calibration_feedback_pending = False
+calibration_status_text = "等待初始化标定"
+calibration_model = None
+calibration_model_summary = "未拟合"
+calibration_lock = threading.Lock()
+# 多项式拟合系数: 6个参数对应1,x,y,x^2,y^2,xy
+offset_coeffs_x = None
+offset_coeffs_y = None
+offset_coeffs_z = None
+
 # ================= 📐 坐标与深度计算 (鲁棒性升级，集成Z轴自动校正) =================
 def get_robust_region_depth(depth_img, x, y, radius=4):
     """带抗噪滤波的深度提取"""
@@ -522,10 +946,10 @@ def get_robust_region_depth(depth_img, x, y, radius=4):
         return np.mean(filtered) if len(filtered) > 0 else np.median(valid)
     return 0
 
-def pixel_to_robot_xyz(u, v, depth_frame):
-    """像素坐标转机械臂坐标（集成Z轴自动校正）"""
+def pixel_to_robot_raw_xyz(u, v, depth_frame):
+    """像素坐标转机械臂原始坐标，不叠加16点校准映射。"""
     global matrix_pixel_to_world, base_pos_world, table_depth_val
-    global offset_x, offset_y, offset_z, last_z_error
+    global last_z_error
     
     if matrix_pixel_to_world is None or depth_frame is None:
         return None
@@ -542,19 +966,22 @@ def pixel_to_robot_xyz(u, v, depth_frame):
     else:
         rob_z = TABLE_BASE_Z+6.0  # 默认高度，避免过低
     
-    # 🔧 应用Z轴自动校正（基于原始坐标）
-    if coefficients is not None:
+    if ENABLE_LEGACY_Z_CORRECTION and coefficients is not None:
         z_error = compute_z_error(raw_x, raw_y)
         rob_z -= z_error  # 减去系统误差
-        # 保存校正值用于显示
         last_z_error = z_error
-    
-    # 添加手动偏移
-    rob_z += offset_z
-    rob_x = raw_x + offset_x
-    rob_y = raw_y + offset_y
-    
-    return rob_x, rob_y, rob_z
+    else:
+        last_z_error = 0.0
+
+    return raw_x, raw_y, rob_z
+
+
+def pixel_to_robot_xyz(u, v, depth_frame):
+    """像素坐标转机械臂抓取坐标（raw_xyz -> success_xyz）。"""
+    raw_xyz = pixel_to_robot_raw_xyz(u, v, depth_frame)
+    if raw_xyz is None:
+        return None
+    return apply_calibrated_mapping(raw_xyz)
 
 # ================= 🤖 机械臂控制 (带重试机制) =================
 http_session = requests.Session()
@@ -612,6 +1039,7 @@ def smart_search_and_grab(user_command, color_frame, depth_frame, masks_list):
     3. 逐个询问：调用大模型，一旦确认，立即抓取并停止。
     """
     global robot_busy
+    set_ai_inspection_overlay(None)
     
     if robot_busy:
         print("⚠️ 机械臂正忙，请等待当前任务完成")
@@ -665,13 +1093,8 @@ def smart_search_and_grab(user_command, color_frame, depth_frame, masks_list):
         candidate = candidates[i]
         obj = candidate['obj']
         
-        # 在屏幕上画框，让用户知道 AI 正在看哪个
-        debug_img = color_frame.copy()
         x, y, w, h = obj['bbox']
-        cv2.rectangle(debug_img, (x, y), (x+w, y+h), (0, 255, 0), 3)
-        cv2.putText(debug_img, f"Checking #{i+1}...", (x, y-10), 0, 0.8, (0, 255, 0), 2)
-        cv2.imshow("AI_Vision", debug_img)
-        cv2.waitKey(50)  # 稍微停顿展示一下
+        set_ai_inspection_overlay((x, y, w, h), f"Checking #{i+1}...")
 
         # 截取该物体的图片
         crop_img = obj['crop'] 
@@ -685,6 +1108,8 @@ def smart_search_and_grab(user_command, color_frame, depth_frame, masks_list):
             print(f"✅ 找到了！目标锁定：候选物体 #{i+1}")
             target_obj = obj
             break  # 找到了就立刻退出循环
+
+    set_ai_inspection_overlay(None)
 
     # --- 4. 结果处理 ---
     if target_obj:
@@ -716,11 +1141,35 @@ table_depth_val = 0
 detected_masks = []
 robot_busy = False
 latest_depth_frame = None
+ai_inspection_overlay = None
+ai_inspection_overlay_lock = threading.Lock()
+
+
+def set_ai_inspection_overlay(bbox=None, text=""):
+    """由工作线程更新 AI 正在检查的候选物体，由主线程负责渲染。"""
+    global ai_inspection_overlay
+    with ai_inspection_overlay_lock:
+        if bbox is None:
+            ai_inspection_overlay = None
+            return
+        x, y, w, h = bbox
+        ai_inspection_overlay = {
+            'bbox': (int(x), int(y), int(w), int(h)),
+            'text': text,
+        }
+
+
+def get_ai_inspection_overlay():
+    with ai_inspection_overlay_lock:
+        if ai_inspection_overlay is None:
+            return None
+        return dict(ai_inspection_overlay)
 
 def mouse_callback(event, x, y, flags, param):
     """鼠标回调：整合标定与手动抓取功能"""
     global state, calib_points, base_point_pixel, base_pos_world
     global matrix_pixel_to_world, table_depth_val, robot_busy, latest_depth_frame
+    global calibrating, calibration_count
     
     if event == cv2.EVENT_LBUTTONDOWN:
         if state == 0:  # 标定阶段：点击A4纸四个角
@@ -746,49 +1195,68 @@ def mouse_callback(event, x, y, flags, param):
             base_point_pixel = (x, y)
             vec = np.array([[[x, y]]], dtype=np.float32)
             base_pos_world = cv2.perspectiveTransform(vec, matrix_pixel_to_world)[0][0]
-            state = 2
+            start_pregrab_calibration()
             print(f"\n>>> 系统已完全就绪！底座原点: {base_pos_world}")
-            print(">>> 现在可以：")
-            print("    1. 点击画面中的物体进行手动抓取")
-            print("    2. 使用手机语音控制")
+            print("🚧 进入初始化 16 次预抓取校准模式。")
+            print("    每次点击一个目标，系统先按 raw_xyz 执行预抓取。")
+            print("    抓取结束后，请在 Flask 网页输入 dx dy dz，系统将计算 success_xyz = raw_xyz + offset_xyz。")
+            print("    16次样本完成后，系统会自动拟合 raw_xyz -> success_xyz 映射并进入常规模式。")
+            print(">>> 另外：")
+            print("    1. 校准完成前，语音抓取与普通点击抓取会被锁定。")
+            print("    2. 校准完成后，再使用手机语音或鼠标抓取。")
             
-        elif state == 2 and not robot_busy:  # 就绪状态：手动抓取
+        elif state in (2, 3) and not robot_busy:  # 校准或就绪状态
+            if calibrating and calibration_waiting_feedback:
+                print("⏳ 当前正在等待网页输入上一抓的 dx dy dz，请先提交偏移量。")
+                return
+
             # 寻找最近的物体
             best_obj = None
             min_dist = 50  # 像素距离阈值
             for obj in detected_masks:
-                # 优先使用抓取点，如果没有则使用中心点
                 if 'grasp_point' in obj:
                     cx, cy = obj['grasp_point']
                 else:
                     cx, cy = obj['center']
-                    
                 d = math.hypot(cx - x, cy - y)
                 if d < min_dist:
                     min_dist, best_obj = d, obj
             
             if best_obj:
-                # 计算坐标并抓取
                 if 'grasp_point' in best_obj:
                     cx, cy = best_obj['grasp_point']
                 else:
                     cx, cy = best_obj['center']
-                    
-                coords = pixel_to_robot_xyz(cx, cy, latest_depth_frame)
-                if coords:
-                    rx, ry, rz = coords
-                    # 安全检查：防止抓取基座附近的物体
-                    if rx > 5.0:  
-                        threading.Thread(target=grab_sequence, args=(rx, ry, rz), daemon=True).start()
+                raw_coords = pixel_to_robot_raw_xyz(cx, cy, latest_depth_frame)
+                if raw_coords:
+                    rx, ry, rz = raw_coords
+                    if rx > 5.0:
+                        if calibrating:
+                            threading.Thread(
+                                target=launch_calibration_pregrab,
+                                args=((rx, ry, rz), (x, y), (cx, cy)),
+                                daemon=True,
+                            ).start()
+                        else:
+                            success_coords = apply_calibrated_mapping((rx, ry, rz))
+                            threading.Thread(target=grab_sequence, args=success_coords, daemon=True).start()
                     else:
                         print(">>> ⚠️ 目标太靠近基座，系统拒绝执行以防止碰撞。")
                 else:
                     print(">>> ❌ 无法计算目标坐标")
+            # 如果正在校准，不继续执行正常抓取逻辑
+            if calibrating:
+                return
 
 def reset_system():
     """重置系统状态"""
     global state, calib_points, base_point_pixel, base_pos_world
     global matrix_pixel_to_world, table_depth_val, detected_masks, robot_busy
+    global calibrating, calibration_count, calibration_samples
+    global pending_calibration_sample, calibration_waiting_feedback
+    global calibration_feedback_pending, calibration_status_text
+    global calibration_model, calibration_model_summary
+    global offset_x, offset_y, offset_z, last_z_error
     
     state = 0
     calib_points = []
@@ -797,12 +1265,28 @@ def reset_system():
     matrix_pixel_to_world = None
     table_depth_val = 0
     detected_masks = []
+    # 重置校准相关
+    calibrating = False
+    calibration_count = 0
+    calibration_samples = []
+    pending_calibration_sample = None
+    calibration_waiting_feedback = False
+    calibration_feedback_pending = False
+    calibration_status_text = "等待初始化标定"
+    calibration_model = None
+    calibration_model_summary = "未拟合"
+    offset_x = 0
+    offset_y = 0
+    offset_z = 0
+    last_z_error = 0.0
+    set_ai_inspection_overlay(None)
     # 注意：不重置 robot_busy，让当前任务完成
     print("\n[系统复位] 所有标定与坐标系缓存已清空。请重新标定。")
 
 # ================= 🎨 显示函数 (整合HUD) =================
 def draw_hud(frame, state, robot_busy):
     """绘制HUD面板"""
+    global calibrating, calibration_count, calibration_max, calibration_waiting_feedback
     h, w = frame.shape[:2]
     
     # 底部半透明黑色面板
@@ -815,6 +1299,8 @@ def draw_hud(frame, state, robot_busy):
         msg = "[Step 1] Click 4 corners of A4 paper"
     elif state == 1:
         msg = "[Step 2] Click Robot Base Origin"
+    elif state == 2:
+        msg = "[Step 3] Pre-grab calibration: click target and submit dx dy dz"
     else:
         msg = "[READY] Click Object to GRAB or use Voice Control"
     
@@ -834,6 +1320,14 @@ def draw_hud(frame, state, robot_busy):
     obj_count = len(detected_masks)
     cv2.putText(frame, f"Objects: {obj_count}", (w // 2 - 60, h - 18), 
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
+    
+    # 如果正在进行初始校准，显示进度
+    if calibrating:
+        status_text = f"CALIBRATE {calibration_count}/{calibration_max}"
+        if calibration_waiting_feedback:
+            status_text += " | WAIT INPUT"
+        cv2.putText(frame, status_text,
+                    (w - 300, h - 18), cv2.FONT_HERSHEY_DUPLEX, 0.7, (0, 255, 255), 1, cv2.LINE_AA)
 
 # ================= 🎛️ 新增：校正窗口函数 =================
 def create_calibration_window():
@@ -868,10 +1362,17 @@ def update_calibration_values():
 
 def draw_calibration_display():
     """在图片上显示当前的校正值"""
-    global offset_x, offset_y, offset_z, last_z_error
+    global offset_x, offset_y, offset_z, last_z_error, calibrating, calibration_count, calibration_max
+    global calibration_waiting_feedback, calibration_status_text, calibration_model_summary
     line1 = f"offset: X:{offset_x:+.1f}cm Y:{offset_y:+.1f}cm Z:{offset_z:+.1f}cm"
     line2 = f"auto Z corr: {last_z_error:+.2f}cm"
-    return line1, line2
+    if calibrating:
+        wait_suffix = " waiting dx dy dz" if calibration_waiting_feedback else " click next target"
+        line3 = f"CALIB: {calibration_count}/{calibration_max}{wait_suffix}"
+    else:
+        line3 = calibration_model_summary if calibration_model is not None else ""
+    line4 = calibration_status_text[:80] if calibration_status_text else ""
+    return line1, line2, line3, line4
 
 # ================= 🚀 主程序 (防崩溃优化版，集成Z轴自动校正) =================
 def main():
@@ -1016,12 +1517,16 @@ def main():
             # 4. 处理语音指令
             try:
                 cmd_text = cmd_queue.get_nowait()
-                if state == 2 and not robot_busy and cmd_text:
+                if state == 3 and not robot_busy and not calibrating and cmd_text:
                     threading.Thread(target=smart_search_and_grab, 
                                    args=(cmd_text, color_img, depth_img, detected_masks), 
                                    daemon=True).start()
+                elif cmd_text:
+                    print("⏸️ 当前不接受语音抓取，需先完成初始化校准。")
             except queue.Empty:
                 pass
+
+            handle_calibration_feedback_queue()
             
             # 5. 渲染画面
             display_img = color_img.copy()
@@ -1066,12 +1571,16 @@ def main():
                     cv2.circle(display_img, (gx, gy), 4, (0, 0, 255), -1)  # 红色实心
                     
                     # 计算并显示3D坐标
-                    if state == 2 and depth_img is not None and table_depth_val > 0:
-                        coords = pixel_to_robot_xyz(gx, gy, depth_img)
-                        if coords:
-                            rx, ry, rz = coords
+                    if state in (2, 3) and depth_img is not None and table_depth_val > 0:
+                        raw_coords = pixel_to_robot_raw_xyz(gx, gy, depth_img)
+                        if raw_coords:
+                            raw_x, raw_y, raw_z = raw_coords
+                            success_x, success_y, success_z = apply_calibrated_mapping(raw_coords)
                             # 在抓取点附近显示3D坐标
-                            coord_text = f"X:{rx:.1f} Y:{ry:.1f} Z:{rz:.1f}"
+                            if state == 2:
+                                coord_text = f"RAW X:{raw_x:.1f} Y:{raw_y:.1f} Z:{raw_z:.1f}"
+                            else:
+                                coord_text = f"OK X:{success_x:.1f} Y:{success_y:.1f} Z:{success_z:.1f}"
                             text_bg_y = gy - 60 if gy > 60 else gy + 20
                             # 绘制文本背景
                             text_size = cv2.getTextSize(coord_text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
@@ -1107,11 +1616,27 @@ def main():
                 cv2.drawMarker(display_img, base_point_pixel, (255, 0, 255), cv2.MARKER_CROSS, 20, 3)
             
             # 添加校正值显示
-            calib_line1, calib_line2 = draw_calibration_display()
+            calib_line1, calib_line2, calib_line3, calib_line4 = draw_calibration_display()
             cv2.putText(display_img, calib_line1, (15, 30), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
             cv2.putText(display_img, calib_line2, (15, 55), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+            if calib_line3:
+                cv2.putText(display_img, calib_line3, (15, 80), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+            if calib_line4:
+                cv2.putText(display_img, calib_line4, (15, 105), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.55, (180, 255, 180), 1)
+
+            ai_overlay = get_ai_inspection_overlay()
+            if ai_overlay:
+                x, y, w, h = ai_overlay['bbox']
+                label = ai_overlay['text']
+                cv2.rectangle(display_img, (x, y), (x + w, y + h), (0, 255, 0), 3)
+                if label:
+                    text_y = y - 12 if y > 24 else y + h + 24
+                    cv2.putText(display_img, label, (x, text_y), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
             
             draw_hud(display_img, state, robot_busy)
             cv2.imshow("AI_Vision", display_img)
